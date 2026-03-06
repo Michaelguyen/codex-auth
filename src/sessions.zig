@@ -45,10 +45,19 @@ fn scanFileForUsage(allocator: std.mem.Allocator, path: []const u8) !?registry.R
         const trimmed = std.mem.trim(u8, line, " \r\t");
         if (trimmed.len == 0) continue;
         if (parseUsageLine(allocator, trimmed)) |snap| {
+            if (last) |*prev| {
+                freeUsageSnapshot(allocator, prev);
+            }
             last = snap;
         }
     }
     return last;
+}
+
+fn freeUsageSnapshot(allocator: std.mem.Allocator, snapshot: *registry.RateLimitSnapshot) void {
+    if (snapshot.credits) |*credits| {
+        if (credits.balance) |balance| allocator.free(balance);
+    }
 }
 
 pub fn parseUsageLine(allocator: std.mem.Allocator, line: []const u8) ?registry.RateLimitSnapshot {
