@@ -27,7 +27,8 @@ Package `codex-auth` as the public npm package `@loongphy/codex-auth` and make `
 - `package.json` at repo root for the npm entry package
 - `bin/` or equivalent root-package launcher for resolving and executing the installed platform binary
 - `npm/` or `dist/npm/` subtree for the root package plus three platform package manifests and binaries
-- `.github/workflows/ci.yml` for build, package, release, and npm publish automation
+- `.github/workflows/ci.yml` for branch/PR validation
+- `.github/workflows/release.yml` for tag-driven package, release, and npm publish automation
 - `src/version.zig` for CLI version output alignment
 - `README.md` for npm install and usage documentation
 - `docs/implement.md` for packaging and release-process documentation
