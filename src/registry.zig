@@ -134,6 +134,31 @@ pub fn cloneRolloutSignature(allocator: std.mem.Allocator, signature: RolloutSig
     };
 }
 
+pub fn cloneRateLimitSnapshot(allocator: std.mem.Allocator, snapshot: RateLimitSnapshot) !RateLimitSnapshot {
+    var cloned_credits: ?CreditsSnapshot = null;
+    if (snapshot.credits) |credits| {
+        var cloned_balance: ?[]u8 = null;
+        if (credits.balance) |balance| {
+            cloned_balance = try allocator.dupe(u8, balance);
+        }
+        cloned_credits = .{
+            .has_credits = credits.has_credits,
+            .unlimited = credits.unlimited,
+            .balance = cloned_balance,
+        };
+    }
+    errdefer if (cloned_credits) |credits| {
+        if (credits.balance) |balance| allocator.free(balance);
+    };
+
+    return .{
+        .primary = snapshot.primary,
+        .secondary = snapshot.secondary,
+        .credits = cloned_credits,
+        .plan_type = snapshot.plan_type,
+    };
+}
+
 fn setRolloutSignature(
     allocator: std.mem.Allocator,
     target: *?RolloutSignature,
@@ -2504,7 +2529,8 @@ fn parseThresholdPercent(v: std.json.Value) ?u8 {
     return @as(u8, @intCast(raw));
 }
 
-pub fn refreshAccountsFromAuth(allocator: std.mem.Allocator, codex_home: []const u8, reg: *Registry) !void {
+pub fn refreshAccountsFromAuth(allocator: std.mem.Allocator, codex_home: []const u8, reg: *Registry) !bool {
+    var changed = false;
     for (reg.accounts.items) |*rec| {
         const path = resolveStrictAccountAuthPath(allocator, codex_home, rec.account_key) catch |err| switch (err) {
             error.FileNotFound => continue,
@@ -2537,9 +2563,12 @@ pub fn refreshAccountsFromAuth(allocator: std.mem.Allocator, codex_home: []const
             std.log.warn("auth file record_key mismatch for {s}; skipping refresh", .{rec.email});
             continue;
         }
+        if (rec.plan != info.plan) changed = true;
+        if (rec.auth_mode != info.auth_mode) changed = true;
         rec.plan = info.plan;
         rec.auth_mode = info.auth_mode;
     }
+    return changed;
 }
 
 pub fn autoImportActiveAuth(allocator: std.mem.Allocator, codex_home: []const u8, reg: *Registry) !bool {

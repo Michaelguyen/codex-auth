@@ -13,6 +13,27 @@ pub const LatestUsage = struct {
     }
 };
 
+pub const LatestRolloutEvent = struct {
+    path: []u8,
+    mtime: i64,
+    event_timestamp_ms: i64,
+    snapshot: ?registry.RateLimitSnapshot,
+
+    pub fn deinit(self: *LatestRolloutEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.snapshot) |*snapshot| {
+            registry.freeRateLimitSnapshot(allocator, snapshot);
+        }
+    }
+
+    pub fn hasUsableWindows(self: LatestRolloutEvent) bool {
+        if (self.snapshot) |snapshot| {
+            return snapshot.primary != null or snapshot.secondary != null;
+        }
+        return false;
+    }
+};
+
 const RolloutCandidate = struct {
     path: []u8,
     mtime: i64,
@@ -20,7 +41,7 @@ const RolloutCandidate = struct {
 
 const ParsedUsageEvent = struct {
     event_timestamp_ms: i64,
-    snapshot: registry.RateLimitSnapshot,
+    snapshot: ?registry.RateLimitSnapshot,
 };
 
 const UsageEventLineJson = struct {
@@ -55,6 +76,39 @@ const UsageCreditsJson = struct {
 
 const max_recent_rollout_files: usize = 1;
 const max_rollout_line_bytes: usize = 10 * 1024 * 1024;
+const rollout_full_rescan_interval_ns = 15 * std.time.ns_per_s;
+
+pub const RolloutScanCache = struct {
+    last_full_scan_at_ns: i128 = 0,
+    latest: ?LatestRolloutEvent = null,
+
+    pub fn deinit(self: *RolloutScanCache, allocator: std.mem.Allocator) void {
+        self.clear(allocator);
+    }
+
+    fn clear(self: *RolloutScanCache, allocator: std.mem.Allocator) void {
+        if (self.latest) |*latest| {
+            latest.deinit(allocator);
+        }
+        self.latest = null;
+        self.last_full_scan_at_ns = 0;
+    }
+
+    fn replace(self: *RolloutScanCache, allocator: std.mem.Allocator, latest: ?LatestRolloutEvent, scanned_at_ns: i128) void {
+        if (self.latest) |*cached| {
+            cached.deinit(allocator);
+        }
+        self.latest = latest;
+        self.last_full_scan_at_ns = scanned_at_ns;
+    }
+
+    fn cloneLatest(self: *const RolloutScanCache, allocator: std.mem.Allocator) !?LatestRolloutEvent {
+        if (self.latest) |latest| {
+            return try cloneLatestRolloutEvent(allocator, latest);
+        }
+        return null;
+    }
+};
 
 pub fn scanLatestUsage(allocator: std.mem.Allocator, codex_home: []const u8) !?registry.RateLimitSnapshot {
     const latest = try scanLatestUsageWithSource(allocator, codex_home);
@@ -64,6 +118,50 @@ pub fn scanLatestUsage(allocator: std.mem.Allocator, codex_home: []const u8) !?r
 }
 
 pub fn scanLatestUsageWithSource(allocator: std.mem.Allocator, codex_home: []const u8) !?LatestUsage {
+    var latest_rollout = (try scanLatestRolloutEventWithSource(allocator, codex_home)) orelse return null;
+    errdefer latest_rollout.deinit(allocator);
+    if (!latest_rollout.hasUsableWindows()) {
+        const latest_usable = try scanLatestUsableUsageInFile(allocator, latest_rollout.path, latest_rollout.mtime);
+        if (latest_usable == null) {
+            latest_rollout.deinit(allocator);
+            return null;
+        }
+        latest_rollout.deinit(allocator);
+        return latest_usable;
+    }
+
+    const snapshot = latest_rollout.snapshot.?;
+    latest_rollout.snapshot = null;
+    return .{
+        .path = latest_rollout.path,
+        .mtime = latest_rollout.mtime,
+        .event_timestamp_ms = latest_rollout.event_timestamp_ms,
+        .snapshot = snapshot,
+    };
+}
+
+pub fn scanLatestUsableUsageInFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    mtime: i64,
+) !?LatestUsage {
+    var latest_usable = (try scanFileForLatestUsableUsage(allocator, path)) orelse return null;
+    errdefer if (latest_usable.snapshot) |*snapshot| {
+        registry.freeRateLimitSnapshot(allocator, snapshot);
+    };
+
+    const owned_path = try allocator.dupe(u8, path);
+    const snapshot = latest_usable.snapshot.?;
+    latest_usable.snapshot = null;
+    return .{
+        .path = owned_path,
+        .mtime = mtime,
+        .event_timestamp_ms = latest_usable.event_timestamp_ms,
+        .snapshot = snapshot,
+    };
+}
+
+pub fn scanLatestRolloutEventWithSource(allocator: std.mem.Allocator, codex_home: []const u8) !?LatestRolloutEvent {
     const sessions_root = try std.fs.path.join(allocator, &[_][]const u8{ codex_home, "sessions" });
     defer allocator.free(sessions_root);
 
@@ -98,32 +196,30 @@ pub fn scanLatestUsageWithSource(allocator: std.mem.Allocator, codex_home: []con
         }
     }.lessThan);
 
-    var best: ?LatestUsage = null;
+    var best: ?LatestRolloutEvent = null;
     const scan_count = @min(candidates.items.len, max_recent_rollout_files);
 
     for (candidates.items[0..scan_count]) |candidate| {
-        const usage = try scanFileForUsage(allocator, candidate.path);
-        if (usage == null) continue;
-
-        const parsed = usage.?;
+        var parsed = (try scanFileForUsage(allocator, candidate.path)) orelse continue;
         const better = best == null or
             parsed.event_timestamp_ms > best.?.event_timestamp_ms or
             (parsed.event_timestamp_ms == best.?.event_timestamp_ms and candidate.mtime > best.?.mtime);
 
         if (!better) {
-            var skipped = parsed;
-            registry.freeRateLimitSnapshot(allocator, &skipped.snapshot);
+            if (parsed.snapshot) |*snapshot| {
+                registry.freeRateLimitSnapshot(allocator, snapshot);
+            }
             continue;
         }
 
         if (best) |*prev| {
-            allocator.free(prev.path);
-            registry.freeRateLimitSnapshot(allocator, &prev.snapshot);
+            prev.deinit(allocator);
         }
 
         const path = allocator.dupe(u8, candidate.path) catch |err| {
-            var failed = parsed;
-            registry.freeRateLimitSnapshot(allocator, &failed.snapshot);
+            if (parsed.snapshot) |*snapshot| {
+                registry.freeRateLimitSnapshot(allocator, snapshot);
+            }
             return err;
         };
         best = .{
@@ -137,7 +233,46 @@ pub fn scanLatestUsageWithSource(allocator: std.mem.Allocator, codex_home: []con
     return best;
 }
 
+pub fn scanLatestRolloutEventWithCache(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    cache: *RolloutScanCache,
+) !?LatestRolloutEvent {
+    const now_ns = std.time.nanoTimestamp();
+
+    if (cache.latest) |cached| {
+        const stat = std.fs.cwd().statFile(cached.path) catch |err| switch (err) {
+            error.FileNotFound => return try refreshRolloutScanCache(allocator, codex_home, cache, now_ns),
+            else => return err,
+        };
+        const current_mtime: i64 = @intCast(stat.mtime);
+        if (current_mtime != cached.mtime) {
+            const reparsed = try scanFileForUsage(allocator, cached.path);
+            if (reparsed) |parsed| {
+                const updated = try latestRolloutEventFromParsedUsage(allocator, cached.path, current_mtime, parsed);
+                cache.replace(allocator, updated, cache.last_full_scan_at_ns);
+                return try cache.cloneLatest(allocator);
+            }
+            return try refreshRolloutScanCache(allocator, codex_home, cache, now_ns);
+        }
+
+        if (cache.last_full_scan_at_ns != 0 and (now_ns - cache.last_full_scan_at_ns) < rollout_full_rescan_interval_ns) {
+            return try cache.cloneLatest(allocator);
+        }
+    }
+
+    return try refreshRolloutScanCache(allocator, codex_home, cache, now_ns);
+}
+
 fn scanFileForUsage(allocator: std.mem.Allocator, path: []const u8) !?ParsedUsageEvent {
+    return scanFileForUsageWithMode(allocator, path, true);
+}
+
+fn scanFileForLatestUsableUsage(allocator: std.mem.Allocator, path: []const u8) !?ParsedUsageEvent {
+    return scanFileForUsageWithMode(allocator, path, false);
+}
+
+fn scanFileForUsageWithMode(allocator: std.mem.Allocator, path: []const u8, keep_latest_unusable: bool) !?ParsedUsageEvent {
     var file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
@@ -182,13 +317,58 @@ fn scanFileForUsage(allocator: std.mem.Allocator, path: []const u8) !?ParsedUsag
         const trimmed = std.mem.trim(u8, line, " \r\t");
         if (trimmed.len == 0) continue;
         if (parseUsageEventLine(allocator, trimmed)) |event| {
+            if (!keep_latest_unusable and event.snapshot == null) {
+                continue;
+            }
             if (last) |*prev| {
-                registry.freeRateLimitSnapshot(allocator, &prev.snapshot);
+                if (prev.snapshot) |*snapshot| {
+                    registry.freeRateLimitSnapshot(allocator, snapshot);
+                }
             }
             last = event;
         }
     }
     return last;
+}
+
+fn refreshRolloutScanCache(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    cache: *RolloutScanCache,
+    scanned_at_ns: i128,
+) !?LatestRolloutEvent {
+    const latest = try scanLatestRolloutEventWithSource(allocator, codex_home);
+    cache.replace(allocator, latest, scanned_at_ns);
+    return try cache.cloneLatest(allocator);
+}
+
+fn latestRolloutEventFromParsedUsage(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    mtime: i64,
+    parsed: ParsedUsageEvent,
+) !LatestRolloutEvent {
+    errdefer if (parsed.snapshot) |*snapshot| {
+        registry.freeRateLimitSnapshot(allocator, snapshot);
+    };
+    return .{
+        .path = try allocator.dupe(u8, path),
+        .mtime = mtime,
+        .event_timestamp_ms = parsed.event_timestamp_ms,
+        .snapshot = parsed.snapshot,
+    };
+}
+
+fn cloneLatestRolloutEvent(allocator: std.mem.Allocator, latest: LatestRolloutEvent) !LatestRolloutEvent {
+    return .{
+        .path = try allocator.dupe(u8, latest.path),
+        .mtime = latest.mtime,
+        .event_timestamp_ms = latest.event_timestamp_ms,
+        .snapshot = if (latest.snapshot) |snapshot|
+            try registry.cloneRateLimitSnapshot(allocator, snapshot)
+        else
+            null,
+    };
 }
 
 pub fn parseUsageLine(allocator: std.mem.Allocator, line: []const u8) ?registry.RateLimitSnapshot {
@@ -209,8 +389,10 @@ fn parseUsageEventLine(allocator: std.mem.Allocator, line: []const u8) ?ParsedUs
     if (!std.mem.eql(u8, root.payload.type, "token_count")) return null;
 
     const event_timestamp_ms = parseTimestampMs(root.timestamp) orelse return null;
-    const rate_limits = root.payload.rate_limits orelse return null;
-    const snapshot = parseRateLimits(allocator, rate_limits);
+    const snapshot = if (root.payload.rate_limits) |rate_limits|
+        parseRateLimits(allocator, rate_limits)
+    else
+        null;
     return .{
         .event_timestamp_ms = event_timestamp_ms,
         .snapshot = snapshot,
@@ -224,12 +406,18 @@ fn looksLikeUsageEventLine(line: []const u8) bool {
         std.mem.indexOf(u8, line, "\"timestamp\"") != null;
 }
 
-fn parseRateLimits(allocator: std.mem.Allocator, parsed: UsageRateLimitsJson) registry.RateLimitSnapshot {
+fn parseRateLimits(allocator: std.mem.Allocator, parsed: UsageRateLimitsJson) ?registry.RateLimitSnapshot {
     var snap = registry.RateLimitSnapshot{ .primary = null, .secondary = null, .credits = null, .plan_type = null };
     if (parsed.primary) |p| snap.primary = parseWindow(p);
     if (parsed.secondary) |p| snap.secondary = parseWindow(p);
     if (parsed.credits) |c| snap.credits = parseCredits(allocator, c);
     if (parsed.plan_type) |p| snap.plan_type = parsePlanType(p);
+    if (snap.primary == null and snap.secondary == null) {
+        if (snap.credits) |*credits| {
+            if (credits.balance) |balance| allocator.free(balance);
+        }
+        return null;
+    }
     return snap;
 }
 
