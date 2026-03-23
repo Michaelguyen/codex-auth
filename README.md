@@ -42,10 +42,13 @@ npx @loongphy/codex-auth list
   npm packages currently support Linux x64, macOS x64, macOS arm64, and Windows x64.
 
 > [!NOTE]
+> If you only installed `@loongphy/codex-auth` with npm, you do not need any legacy cleanup steps.
 > Older Bash/PowerShell GitHub-release installs could leave a standalone `codex-auth` binary outside npm's install path.
-> Those legacy installs can shadow the npm package or a local source build, so remove them during migration.
+> If you previously used those legacy installers, remove the leftover binaries and profile changes during migration.
 
 ### Uninstall
+
+#### npm
 
 Remove the npm package:
 
@@ -53,7 +56,9 @@ Remove the npm package:
 npm uninstall -g @loongphy/codex-auth
 ```
 
-Remove old Bash-installer leftovers on Linux/macOS/WSL2:
+#### Legacy Bash Installer
+
+For non-npm installs on Linux/macOS/WSL2 only:
 
 ```shell
 rm -f ~/.local/bin/codex-auth
@@ -61,13 +66,15 @@ rm -f ~/.local/bin/codex-auth-auto
 sed -i '/# Added by codex-auth installer/,+1d' ~/.bashrc ~/.bash_profile ~/.profile ~/.zshrc ~/.zprofile 2>/dev/null || true
 ```
 
-If you used fish:
+If you used fish, also remove the old profile entry:
 
 ```shell
 sed -i '/# Added by codex-auth installer/,+3d' ~/.config/fish/config.fish 2>/dev/null || true
 ```
 
-Remove old PowerShell-installer leftovers on Windows:
+#### Legacy PowerShell Installer
+
+For non-npm installs on Windows only:
 
 ```powershell
 Remove-Item "$env:LOCALAPPDATA\codex-auth\bin\codex-auth.exe" -Force -ErrorAction SilentlyContinue
@@ -77,13 +84,6 @@ Remove-Item "$env:LOCALAPPDATA\codex-auth\bin\codex-auth-auto.exe" -Force -Error
   (($env:Path -split ';' | Where-Object { $_ -and $_ -ne "$env:LOCALAPPDATA\codex-auth\bin" }) -join ';'),
   "User"
 )
-```
-
-After cleanup, verify which binary is still active:
-
-```shell
-which codex-auth
-codex-auth --version
 ```
 
 ## Commands
