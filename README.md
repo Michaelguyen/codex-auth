@@ -332,8 +332,6 @@ Verify with:
 codex exec "say hello"
 ```
 
-> **Output format:** Each converted file contains `auth_mode`, `OPENAI_API_KEY`, `tokens` (with `id_token`, `access_token`, `refresh_token`, `account_id`), and `last_refresh`. The `refresh_token` field is required for token refresh to work.
-
 ## Disclaimer
 
 This project is provided as-is and use is at your own risk.
