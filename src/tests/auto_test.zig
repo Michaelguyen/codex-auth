@@ -1,4 +1,5 @@
 const std = @import("std");
+const account_api = @import("../account_api.zig");
 const auto = @import("../auto.zig");
 const registry = @import("../registry.zig");
 const usage_api = @import("../usage_api.zig");
@@ -18,9 +19,365 @@ const empty_rate_limits_rollout_line = "{" ++
     "\"payload\":{\"type\":\"token_count\",\"rate_limits\":{}}}";
 var daemon_api_fetch_count: usize = 0;
 var candidate_api_fetch_count: usize = 0;
+var daemon_account_name_fetch_count: usize = 0;
+var daemon_account_name_fetch_registry_rewrite_codex_home: ?[]const u8 = null;
 var candidate_high_auth_path: ?[]const u8 = null;
 var candidate_low_auth_path: ?[]const u8 = null;
 var candidate_reject_auth_path: ?[]const u8 = null;
+const daemon_grouped_user_id = "user-auto-grouped";
+const daemon_primary_account_id = "67fe2bbb-0de6-49a4-b2b3-d1df366d1faf";
+const daemon_secondary_account_id = "518a44d9-ba75-4bad-87e5-ae9377042960";
+
+fn appendGroupedAccount(
+    allocator: std.mem.Allocator,
+    reg: *registry.Registry,
+    chatgpt_user_id: []const u8,
+    chatgpt_account_id: []const u8,
+    email: []const u8,
+    plan: registry.PlanType,
+) !void {
+    const record_key = try std.fmt.allocPrint(allocator, "{s}::{s}", .{ chatgpt_user_id, chatgpt_account_id });
+    errdefer allocator.free(record_key);
+
+    try reg.accounts.append(allocator, .{
+        .account_key = record_key,
+        .chatgpt_account_id = try allocator.dupe(u8, chatgpt_account_id),
+        .chatgpt_user_id = try allocator.dupe(u8, chatgpt_user_id),
+        .email = try allocator.dupe(u8, email),
+        .alias = try allocator.dupe(u8, ""),
+        .account_name = null,
+        .plan = plan,
+        .auth_mode = .chatgpt,
+        .created_at = std.time.timestamp(),
+        .last_used_at = null,
+        .last_usage = null,
+        .last_usage_at = null,
+        .last_local_rollout = null,
+    });
+}
+
+fn authJsonWithIds(
+    allocator: std.mem.Allocator,
+    email: []const u8,
+    plan: []const u8,
+    chatgpt_user_id: []const u8,
+    chatgpt_account_id: []const u8,
+) ![]u8 {
+    const header = "{\"alg\":\"none\",\"typ\":\"JWT\"}";
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"email\":\"{s}\",\"https://api.openai.com/auth\":{{\"chatgpt_account_id\":\"{s}\",\"chatgpt_user_id\":\"{s}\",\"user_id\":\"{s}\",\"chatgpt_plan_type\":\"{s}\"}}}}",
+        .{ email, chatgpt_account_id, chatgpt_user_id, chatgpt_user_id, plan },
+    );
+    defer allocator.free(payload);
+
+    const header_b64 = try bdd.b64url(allocator, header);
+    defer allocator.free(header_b64);
+    const payload_b64 = try bdd.b64url(allocator, payload);
+    defer allocator.free(payload_b64);
+    const jwt = try std.mem.concat(allocator, u8, &[_][]const u8{ header_b64, ".", payload_b64, ".sig" });
+    defer allocator.free(jwt);
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "{{\"tokens\":{{\"access_token\":\"access-{s}\",\"account_id\":\"{s}\",\"id_token\":\"{s}\"}}}}",
+        .{ email, chatgpt_account_id, jwt },
+    );
+}
+
+fn writeActiveAuthWithIds(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    email: []const u8,
+    plan: []const u8,
+    chatgpt_user_id: []const u8,
+    chatgpt_account_id: []const u8,
+) !void {
+    const auth_path = try registry.activeAuthPath(allocator, codex_home);
+    defer allocator.free(auth_path);
+
+    const auth_json = try authJsonWithIds(allocator, email, plan, chatgpt_user_id, chatgpt_account_id);
+    defer allocator.free(auth_json);
+    try std.fs.cwd().writeFile(.{ .sub_path = auth_path, .data = auth_json });
+}
+
+fn writeAccountSnapshotWithIds(
+    allocator: std.mem.Allocator,
+    codex_home: []const u8,
+    email: []const u8,
+    plan: []const u8,
+    chatgpt_user_id: []const u8,
+    chatgpt_account_id: []const u8,
+) !void {
+    const account_key = try std.fmt.allocPrint(allocator, "{s}::{s}", .{ chatgpt_user_id, chatgpt_account_id });
+    defer allocator.free(account_key);
+
+    const auth_path = try registry.accountAuthPath(allocator, codex_home, account_key);
+    defer allocator.free(auth_path);
+
+    const auth_json = try authJsonWithIds(allocator, email, plan, chatgpt_user_id, chatgpt_account_id);
+    defer allocator.free(auth_json);
+    try std.fs.cwd().writeFile(.{ .sub_path = auth_path, .data = auth_json });
+}
+
+fn resetDaemonAccountNameFetcher() void {
+    daemon_account_name_fetch_count = 0;
+    daemon_account_name_fetch_registry_rewrite_codex_home = null;
+}
+
+fn buildGroupedAccountNamesFetchResult(allocator: std.mem.Allocator) !account_api.FetchResult {
+    const entries = try allocator.alloc(account_api.AccountEntry, 2);
+    errdefer allocator.free(entries);
+
+    entries[0] = .{
+        .account_id = try allocator.dupe(u8, daemon_primary_account_id),
+        .account_name = try allocator.dupe(u8, "Primary Workspace"),
+    };
+    errdefer entries[0].deinit(allocator);
+    entries[1] = .{
+        .account_id = try allocator.dupe(u8, daemon_secondary_account_id),
+        .account_name = try allocator.dupe(u8, "Backup Workspace"),
+    };
+    errdefer entries[1].deinit(allocator);
+
+    return .{
+        .entries = entries,
+        .status_code = 200,
+    };
+}
+
+fn fetchGroupedAccountNames(
+    allocator: std.mem.Allocator,
+    access_token: []const u8,
+    account_id: []const u8,
+) !account_api.FetchResult {
+    _ = access_token;
+    _ = account_id;
+    daemon_account_name_fetch_count += 1;
+
+    return buildGroupedAccountNamesFetchResult(allocator);
+}
+
+fn fetchGroupedAccountNamesAfterConcurrentUsageDisable(
+    allocator: std.mem.Allocator,
+    access_token: []const u8,
+    account_id: []const u8,
+) !account_api.FetchResult {
+    _ = access_token;
+    _ = account_id;
+    daemon_account_name_fetch_count += 1;
+
+    const codex_home = daemon_account_name_fetch_registry_rewrite_codex_home orelse return error.TestMissingCodexHome;
+    var latest = try registry.loadRegistry(allocator, codex_home);
+    defer latest.deinit(allocator);
+    latest.api.usage = false;
+    try registry.saveRegistry(allocator, codex_home, &latest);
+
+    return buildGroupedAccountNamesFetchResult(allocator);
+}
+
+test "Scenario: Given auto-switch daemon with missing grouped account names when it detects the active scope then it refreshes and saves them" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try registry.ensureAccountsDir(gpa, codex_home);
+
+    var reg = bdd.makeEmptyRegistry();
+    defer reg.deinit(gpa);
+    reg.auto_switch.enabled = true;
+    reg.api.usage = false;
+    try appendGroupedAccount(gpa, &reg, daemon_grouped_user_id, daemon_primary_account_id, "group@example.com", .team);
+    try appendGroupedAccount(gpa, &reg, daemon_grouped_user_id, daemon_secondary_account_id, "group@example.com", .team);
+    try registry.setActiveAccountKey(gpa, &reg, reg.accounts.items[0].account_key);
+    try registry.saveRegistry(gpa, codex_home, &reg);
+    try writeActiveAuthWithIds(gpa, codex_home, "group@example.com", "team", daemon_grouped_user_id, daemon_primary_account_id);
+
+    resetDaemonAccountNameFetcher();
+    var refresh_state = auto.DaemonRefreshState{};
+    defer refresh_state.deinit(gpa);
+    try std.testing.expect(try auto.daemonCycleWithAccountNameFetcherForTest(
+        gpa,
+        codex_home,
+        &refresh_state,
+        fetchGroupedAccountNames,
+    ));
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), daemon_account_name_fetch_count);
+    try std.testing.expectEqualStrings("Primary Workspace", loaded.accounts.items[0].account_name.?);
+    try std.testing.expectEqualStrings("Backup Workspace", loaded.accounts.items[1].account_name.?);
+
+    try std.testing.expect(try auto.daemonCycleWithAccountNameFetcherForTest(
+        gpa,
+        codex_home,
+        &refresh_state,
+        fetchGroupedAccountNames,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), daemon_account_name_fetch_count);
+}
+
+test "Scenario: Given auto-switch disabled when account names are missing then the daemon skips grouped name refresh" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try registry.ensureAccountsDir(gpa, codex_home);
+
+    var reg = bdd.makeEmptyRegistry();
+    defer reg.deinit(gpa);
+    reg.api.usage = false;
+    try appendGroupedAccount(gpa, &reg, daemon_grouped_user_id, daemon_primary_account_id, "group@example.com", .team);
+    try appendGroupedAccount(gpa, &reg, daemon_grouped_user_id, daemon_secondary_account_id, "group@example.com", .team);
+    try registry.setActiveAccountKey(gpa, &reg, reg.accounts.items[0].account_key);
+
+    resetDaemonAccountNameFetcher();
+    var refresh_state = auto.DaemonRefreshState{};
+    defer refresh_state.deinit(gpa);
+    try std.testing.expect(!(try auto.refreshActiveAccountNamesForDaemonWithFetcher(
+        gpa,
+        codex_home,
+        &reg,
+        &refresh_state,
+        fetchGroupedAccountNames,
+    )));
+    try std.testing.expectEqual(@as(usize, 0), daemon_account_name_fetch_count);
+}
+
+test "Scenario: Given daemon account-name refresh when registry changes during fetch then it merges onto the latest registry" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try registry.ensureAccountsDir(gpa, codex_home);
+
+    var reg = bdd.makeEmptyRegistry();
+    defer reg.deinit(gpa);
+    reg.auto_switch.enabled = true;
+    reg.api.usage = true;
+    reg.api.account = true;
+    try appendGroupedAccount(gpa, &reg, daemon_grouped_user_id, daemon_primary_account_id, "group@example.com", .team);
+    try appendGroupedAccount(gpa, &reg, daemon_grouped_user_id, daemon_secondary_account_id, "group@example.com", .team);
+    try registry.setActiveAccountKey(gpa, &reg, reg.accounts.items[0].account_key);
+    try registry.saveRegistry(gpa, codex_home, &reg);
+    try writeActiveAuthWithIds(gpa, codex_home, "group@example.com", "team", daemon_grouped_user_id, daemon_primary_account_id);
+
+    const rewrite_codex_home = try gpa.dupe(u8, codex_home);
+    defer gpa.free(rewrite_codex_home);
+    resetDaemonAccountNameFetcher();
+    daemon_account_name_fetch_registry_rewrite_codex_home = rewrite_codex_home;
+    defer daemon_account_name_fetch_registry_rewrite_codex_home = null;
+
+    var refresh_state = auto.DaemonRefreshState{};
+    defer refresh_state.deinit(gpa);
+    try std.testing.expect(try auto.daemonCycleWithAccountNameFetcherForTest(
+        gpa,
+        codex_home,
+        &refresh_state,
+        fetchGroupedAccountNamesAfterConcurrentUsageDisable,
+    ));
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), daemon_account_name_fetch_count);
+    try std.testing.expect(!loaded.api.usage);
+    try std.testing.expectEqualStrings("Primary Workspace", loaded.accounts.items[0].account_name.?);
+    try std.testing.expectEqualStrings("Backup Workspace", loaded.accounts.items[1].account_name.?);
+}
+
+test "Scenario: Given auto-switch daemon with only another user missing grouped account names when it runs then it refreshes that stored scope too" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try registry.ensureAccountsDir(gpa, codex_home);
+
+    var reg = bdd.makeEmptyRegistry();
+    defer reg.deinit(gpa);
+    reg.auto_switch.enabled = true;
+    reg.api.usage = false;
+    reg.api.account = true;
+    try appendGroupedAccount(gpa, &reg, "user-active", "acct-active-a", "active@example.com", .team);
+    reg.accounts.items[0].account_name = try gpa.dupe(u8, "Active Workspace");
+    try appendGroupedAccount(gpa, &reg, "user-active", "acct-active-b", "active@example.com", .team);
+    reg.accounts.items[1].account_name = try gpa.dupe(u8, "Active Backup");
+    try appendGroupedAccount(gpa, &reg, daemon_grouped_user_id, daemon_primary_account_id, "group@example.com", .team);
+    try appendGroupedAccount(gpa, &reg, daemon_grouped_user_id, daemon_secondary_account_id, "group@example.com", .team);
+    try registry.setActiveAccountKey(gpa, &reg, reg.accounts.items[0].account_key);
+    try registry.saveRegistry(gpa, codex_home, &reg);
+    try writeActiveAuthWithIds(gpa, codex_home, "active@example.com", "team", "user-active", "acct-active-a");
+    try writeAccountSnapshotWithIds(gpa, codex_home, "group@example.com", "team", daemon_grouped_user_id, daemon_primary_account_id);
+
+    resetDaemonAccountNameFetcher();
+    var refresh_state = auto.DaemonRefreshState{};
+    defer refresh_state.deinit(gpa);
+    try std.testing.expect(try auto.daemonCycleWithAccountNameFetcherForTest(
+        gpa,
+        codex_home,
+        &refresh_state,
+        fetchGroupedAccountNames,
+    ));
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), daemon_account_name_fetch_count);
+    try std.testing.expectEqualStrings("Primary Workspace", loaded.accounts.items[2].account_name.?);
+    try std.testing.expectEqualStrings("Backup Workspace", loaded.accounts.items[3].account_name.?);
+}
+
+test "Scenario: Given auto-switch daemon with grouped team names and only a stored plus snapshot for the same user when it runs then it updates the team records" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try registry.ensureAccountsDir(gpa, codex_home);
+
+    var reg = bdd.makeEmptyRegistry();
+    defer reg.deinit(gpa);
+    reg.auto_switch.enabled = true;
+    reg.api.usage = false;
+    reg.api.account = true;
+    try appendGroupedAccount(gpa, &reg, "user-active", "acct-active-a", "active@example.com", .team);
+    reg.accounts.items[0].account_name = try gpa.dupe(u8, "Active Workspace");
+    try appendGroupedAccount(gpa, &reg, "user-active", "acct-active-b", "active@example.com", .team);
+    reg.accounts.items[1].account_name = try gpa.dupe(u8, "Active Backup");
+    try appendGroupedAccount(gpa, &reg, daemon_grouped_user_id, daemon_primary_account_id, "group@example.com", .team);
+    try appendGroupedAccount(gpa, &reg, daemon_grouped_user_id, daemon_secondary_account_id, "group@example.com", .team);
+    reg.accounts.items[3].account_name = try gpa.dupe(u8, "Old Backup Workspace");
+    try appendGroupedAccount(gpa, &reg, daemon_grouped_user_id, "acct-plus", "group@example.com", .plus);
+    try registry.setActiveAccountKey(gpa, &reg, reg.accounts.items[0].account_key);
+    try registry.saveRegistry(gpa, codex_home, &reg);
+    try writeActiveAuthWithIds(gpa, codex_home, "active@example.com", "team", "user-active", "acct-active-a");
+    try writeAccountSnapshotWithIds(gpa, codex_home, "group@example.com", "plus", daemon_grouped_user_id, "acct-plus");
+
+    resetDaemonAccountNameFetcher();
+    var refresh_state = auto.DaemonRefreshState{};
+    defer refresh_state.deinit(gpa);
+    try std.testing.expect(try auto.daemonCycleWithAccountNameFetcherForTest(
+        gpa,
+        codex_home,
+        &refresh_state,
+        fetchGroupedAccountNames,
+    ));
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), daemon_account_name_fetch_count);
+    try std.testing.expectEqualStrings("Primary Workspace", loaded.accounts.items[2].account_name.?);
+    try std.testing.expectEqualStrings("Backup Workspace", loaded.accounts.items[3].account_name.?);
+    try std.testing.expect(loaded.accounts.items[4].account_name == null);
+}
 
 fn appendAccountWithUsage(
     allocator: std.mem.Allocator,
@@ -1234,6 +1591,7 @@ test "Scenario: Given status when rendering then auto and usage api settings are
         .threshold_5h_percent = 12,
         .threshold_weekly_percent = 8,
         .api_usage_enabled = false,
+        .api_account_enabled = false,
     });
 
     const output = aw.written();
@@ -1241,6 +1599,7 @@ test "Scenario: Given status when rendering then auto and usage api settings are
     try std.testing.expect(std.mem.indexOf(u8, output, "service: running") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "thresholds: 5h<12%, weekly<8%") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "usage: local") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "account: disabled") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Warning: Usage refresh is currently using the ChatGPT usage API") == null);
 }
 
@@ -1255,10 +1614,12 @@ test "Scenario: Given api usage mode when rendering status body then risk warnin
         .threshold_5h_percent = 12,
         .threshold_weekly_percent = 8,
         .api_usage_enabled = true,
+        .api_account_enabled = true,
     });
 
     const output = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, output, "usage: api") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "account: api") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Warning: Usage refresh is currently using the ChatGPT usage API") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "`codex-auth config api disable`") == null);
 }
@@ -1754,39 +2115,4 @@ test "Scenario: Given latest rollout file without usable rate limits when refres
     try std.testing.expect(reg.accounts.items[idx].last_usage != null);
     try std.testing.expectEqual(@as(f64, 41.0), reg.accounts.items[idx].last_usage.?.primary.?.used_percent);
     try std.testing.expectEqual(@as(i64, 777), reg.accounts.items[idx].last_usage_at.?);
-}
-
-test "Scenario: Given permanently null metadata when refreshing accounts from auth then it does not report a change" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
-    defer gpa.free(codex_home);
-    try tmp.dir.makePath("accounts");
-
-    var reg = bdd.makeEmptyRegistry();
-    defer reg.deinit(gpa);
-    try bdd.appendAccount(gpa, &reg, "api@example.com", "", null);
-
-    const account_key = try bdd.accountKeyForEmailAlloc(gpa, "api@example.com");
-    defer gpa.free(account_key);
-    const auth_path = try registry.accountAuthPath(gpa, codex_home, account_key);
-    defer gpa.free(auth_path);
-    try std.fs.cwd().writeFile(.{
-        .sub_path = auth_path,
-        .data =
-        \\{
-        \\  "OPENAI_API_KEY": "sk-test"
-        \\}
-        ,
-    });
-
-    const idx = bdd.findAccountIndexByEmail(&reg, "api@example.com") orelse return error.TestExpectedEqual;
-    reg.accounts.items[idx].plan = null;
-    reg.accounts.items[idx].auth_mode = null;
-
-    try std.testing.expect(!(try registry.refreshAccountsFromAuth(gpa, codex_home, &reg)));
-    try std.testing.expect(reg.accounts.items[idx].plan == null);
-    try std.testing.expect(reg.accounts.items[idx].auth_mode == null);
 }

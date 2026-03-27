@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const account_api = @import("account_api.zig");
 const c_time = @cImport({
     @cInclude("time.h");
 });
@@ -10,6 +11,7 @@ pub const current_schema_version: u32 = 3;
 pub const min_supported_schema_version: u32 = 2;
 pub const default_auto_switch_threshold_5h_percent: u8 = 10;
 pub const default_auto_switch_threshold_weekly_percent: u8 = 5;
+pub const account_name_refresh_lock_file_name = "account-name-refresh.lock";
 
 fn normalizeEmailAlloc(allocator: std.mem.Allocator, email: []const u8) ![]u8 {
     var buf = try allocator.alloc(u8, email.len);
@@ -51,6 +53,13 @@ pub const AutoSwitchConfig = struct {
 
 pub const ApiConfig = struct {
     usage: bool = true,
+    account: bool = true,
+};
+
+const ApiConfigParseResult = struct {
+    has_object: bool = false,
+    has_usage: bool = false,
+    has_account: bool = false,
 };
 
 pub const AccountRecord = struct {
@@ -59,6 +68,7 @@ pub const AccountRecord = struct {
     chatgpt_user_id: []u8,
     email: []u8,
     alias: []u8,
+    account_name: ?[]u8,
     plan: ?PlanType,
     auth_mode: ?AuthMode,
     created_at: i64,
@@ -105,6 +115,7 @@ fn freeAccountRecord(allocator: std.mem.Allocator, rec: *const AccountRecord) vo
     allocator.free(rec.chatgpt_user_id);
     allocator.free(rec.email);
     allocator.free(rec.alias);
+    if (rec.account_name) |account_name| allocator.free(account_name);
     if (rec.last_local_rollout) |*sig| freeRolloutSignature(allocator, sig);
     if (rec.last_usage) |*u| {
         freeRateLimitSnapshot(allocator, u);
@@ -223,6 +234,22 @@ fn optionalStringEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+fn cloneOptionalStringAlloc(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    return if (value) |text| try allocator.dupe(u8, text) else null;
+}
+
+fn replaceOptionalStringAlloc(
+    allocator: std.mem.Allocator,
+    target: *?[]u8,
+    value: ?[]const u8,
+) !bool {
+    if (optionalStringEqual(target.*, value)) return false;
+    const replacement = try cloneOptionalStringAlloc(allocator, value);
+    if (target.*) |existing| allocator.free(existing);
+    target.* = replacement;
+    return true;
 }
 
 fn getNonEmptyEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
@@ -529,6 +556,7 @@ fn isAllowedCurrentSnapshot(reg: *const Registry, entry_name: []const u8) bool {
 fn isAllowedAccountsEntry(reg: *const Registry, entry_name: []const u8) bool {
     if (std.mem.eql(u8, entry_name, "registry.json")) return true;
     if (std.mem.eql(u8, entry_name, "auto-switch.lock")) return true;
+    if (std.mem.eql(u8, entry_name, account_name_refresh_lock_file_name)) return true;
     if (std.mem.eql(u8, entry_name, "backups")) return true;
     return isAllowedCurrentSnapshot(reg, entry_name);
 }
@@ -1742,6 +1770,83 @@ pub fn resolveRateWindow(usage: ?RateLimitSnapshot, minutes: i64, fallback_prima
     return if (fallback_primary) usage.?.primary else usage.?.secondary;
 }
 
+fn hasStoredAccountName(rec: *const AccountRecord) bool {
+    const account_name = rec.account_name orelse return false;
+    return account_name.len != 0;
+}
+
+fn isTeamAccount(rec: *const AccountRecord) bool {
+    const plan = resolvePlan(rec) orelse return false;
+    return plan == .team;
+}
+
+fn inAccountNameRefreshScope(reg: *const Registry, chatgpt_user_id: []const u8, rec: *const AccountRecord) bool {
+    _ = reg;
+    return std.mem.eql(u8, rec.chatgpt_user_id, chatgpt_user_id);
+}
+
+pub fn hasMissingAccountNameForUser(reg: *const Registry, chatgpt_user_id: []const u8) bool {
+    for (reg.accounts.items) |rec| {
+        if (!inAccountNameRefreshScope(reg, chatgpt_user_id, &rec)) continue;
+        if (isTeamAccount(&rec) and !hasStoredAccountName(&rec)) return true;
+    }
+    return false;
+}
+
+pub fn shouldFetchTeamAccountNamesForUser(reg: *const Registry, chatgpt_user_id: []const u8) bool {
+    var account_count: usize = 0;
+    var has_team_account = false;
+    var has_missing_team_account_name = false;
+
+    for (reg.accounts.items) |rec| {
+        if (!inAccountNameRefreshScope(reg, chatgpt_user_id, &rec)) continue;
+
+        account_count += 1;
+        if (!isTeamAccount(&rec)) continue;
+
+        has_team_account = true;
+        if (!hasStoredAccountName(&rec)) {
+            has_missing_team_account_name = true;
+        }
+    }
+
+    if (!has_team_account or !has_missing_team_account_name) return false;
+    return account_count > 1;
+}
+
+pub fn activeChatgptUserId(reg: *Registry) ?[]const u8 {
+    const active_account_key = reg.active_account_key orelse return null;
+    const idx = findAccountIndexByAccountKey(reg, active_account_key) orelse return null;
+    return reg.accounts.items[idx].chatgpt_user_id;
+}
+
+pub fn applyAccountNamesForUser(
+    allocator: std.mem.Allocator,
+    reg: *Registry,
+    chatgpt_user_id: []const u8,
+    entries: []const account_api.AccountEntry,
+) !bool {
+    var changed = false;
+    for (reg.accounts.items) |*rec| {
+        if (!inAccountNameRefreshScope(reg, chatgpt_user_id, rec)) continue;
+
+        var account_name: ?[]const u8 = null;
+        var matched = false;
+        for (entries) |entry| {
+            if (!std.mem.eql(u8, rec.chatgpt_account_id, entry.account_id)) continue;
+            account_name = entry.account_name;
+            matched = true;
+            break;
+        }
+
+        if (!matched and !isTeamAccount(rec) and !hasStoredAccountName(rec)) continue;
+        if (try replaceOptionalStringAlloc(allocator, &rec.account_name, account_name)) {
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 pub fn activateAccountByKey(
     allocator: std.mem.Allocator,
     codex_home: []const u8,
@@ -1802,6 +1907,7 @@ pub fn accountFromAuth(
         .chatgpt_user_id = owned_chatgpt_user_id,
         .email = owned_email,
         .alias = owned_alias,
+        .account_name = null,
         .plan = info.plan,
         .auth_mode = info.auth_mode,
         .created_at = std.time.timestamp(),
@@ -1824,19 +1930,26 @@ fn recordFreshness(rec: *const AccountRecord) i64 {
 }
 
 fn mergeAccountRecord(allocator: std.mem.Allocator, dest: *AccountRecord, incoming: AccountRecord) void {
-    if (recordFreshness(&incoming) > recordFreshness(dest)) {
+    var merged_incoming = incoming;
+    if (recordFreshness(&merged_incoming) > recordFreshness(dest)) {
+        if (merged_incoming.account_name == null and dest.account_name != null) {
+            merged_incoming.account_name = cloneOptionalStringAlloc(allocator, dest.account_name) catch unreachable;
+        }
         freeAccountRecord(allocator, dest);
-        dest.* = incoming;
+        dest.* = merged_incoming;
         return;
     }
-    if (incoming.alias.len != 0 and dest.alias.len == 0) {
-        const replacement = allocator.dupe(u8, incoming.alias) catch allocator.dupe(u8, "") catch unreachable;
+    if (merged_incoming.alias.len != 0 and dest.alias.len == 0) {
+        const replacement = allocator.dupe(u8, merged_incoming.alias) catch allocator.dupe(u8, "") catch unreachable;
         allocator.free(dest.alias);
         dest.alias = replacement;
     }
-    if (dest.plan == null) dest.plan = incoming.plan;
-    if (dest.auth_mode == null) dest.auth_mode = incoming.auth_mode;
-    freeAccountRecord(allocator, &incoming);
+    if (dest.account_name == null and merged_incoming.account_name != null) {
+        dest.account_name = cloneOptionalStringAlloc(allocator, merged_incoming.account_name) catch unreachable;
+    }
+    if (dest.plan == null) dest.plan = merged_incoming.plan;
+    if (dest.auth_mode == null) dest.auth_mode = merged_incoming.auth_mode;
+    freeAccountRecord(allocator, &merged_incoming);
 }
 
 pub fn upsertAccount(allocator: std.mem.Allocator, reg: *Registry, record: AccountRecord) !void {
@@ -1946,6 +2059,7 @@ fn parseAccountRecord(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !Ac
         },
         .email = try normalizeEmailAlloc(allocator, email),
         .alias = try allocator.dupe(u8, alias),
+        .account_name = try parseOptionalStoredStringAlloc(allocator, obj.get("account_name")),
         .plan = null,
         .auth_mode = null,
         .created_at = readInt(obj.get("created_at")) orelse std.time.timestamp(),
@@ -1975,6 +2089,16 @@ fn parseAccountRecord(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !Ac
         rec.last_local_rollout = parseRolloutSignature(allocator, v);
     }
     return rec;
+}
+
+fn parseOptionalStoredStringAlloc(allocator: std.mem.Allocator, value: ?std.json.Value) !?[]u8 {
+    const text = switch (value orelse return null) {
+        .string => |s| s,
+        .null => return null,
+        else => return null,
+    };
+    if (text.len == 0) return null;
+    return try allocator.dupe(u8, text);
 }
 
 fn maybeCopyFile(src: []const u8, dest: []const u8) !void {
@@ -2059,6 +2183,7 @@ fn migrateLegacyRecord(
         .chatgpt_user_id = try allocator.dupe(u8, info.chatgpt_user_id orelse return error.MissingChatgptUserId),
         .email = try allocator.dupe(u8, legacy.email),
         .alias = try allocator.dupe(u8, legacy.alias),
+        .account_name = null,
         .plan = info.plan orelse legacy.plan,
         .auth_mode = info.auth_mode,
         .created_at = legacy.created_at,
@@ -2129,7 +2254,6 @@ fn loadLegacyRegistryV2(
             else => {},
         }
     }
-
     if (root_obj.get("accounts")) |v| {
         switch (v) {
             .array => |arr| {
@@ -2181,7 +2305,6 @@ fn loadCurrentRegistry(allocator: std.mem.Allocator, root_obj: std.json.ObjectMa
     } else if (reg.active_account_key != null) {
         reg.active_account_activated_at_ms = 0;
     }
-
     if (root_obj.get("accounts")) |v| {
         switch (v) {
             .array => |arr| {
@@ -2226,6 +2349,11 @@ fn usesLegacyVersionField(root_obj: std.json.ObjectMap) bool {
 
 fn currentLayoutNeedsRewrite(root_obj: std.json.ObjectMap) bool {
     if (root_obj.get("last_attributed_rollout") != null) return true;
+    if (root_obj.get("api")) |v| {
+        if (apiConfigNeedsRewrite(v)) return true;
+    } else {
+        return true;
+    }
     return root_obj.get("active_account_key") != null and root_obj.get("active_account_activated_at_ms") == null;
 }
 
@@ -2442,16 +2570,45 @@ fn parseAutoSwitch(allocator: std.mem.Allocator, cfg: *AutoSwitchConfig, v: std.
 }
 
 fn parseApiConfig(cfg: *ApiConfig, v: std.json.Value) void {
+    _ = parseApiConfigDetailed(cfg, v);
+}
+
+fn apiConfigNeedsRewrite(v: std.json.Value) bool {
+    var cfg = defaultApiConfig();
+    const result = parseApiConfigDetailed(&cfg, v);
+    return !result.has_object or !result.has_usage or !result.has_account;
+}
+
+fn parseApiConfigDetailed(cfg: *ApiConfig, v: std.json.Value) ApiConfigParseResult {
     const obj = switch (v) {
         .object => |o| o,
-        else => return,
+        else => return .{},
     };
+    var result = ApiConfigParseResult{ .has_object = true };
     if (obj.get("usage")) |usage| {
         switch (usage) {
-            .bool => |flag| cfg.usage = flag,
+            .bool => |flag| {
+                cfg.usage = flag;
+                result.has_usage = true;
+            },
             else => {},
         }
     }
+    if (obj.get("account")) |account| {
+        switch (account) {
+            .bool => |flag| {
+                cfg.account = flag;
+                result.has_account = true;
+            },
+            else => {},
+        }
+    }
+    if (result.has_usage and !result.has_account) {
+        cfg.account = cfg.usage;
+    } else if (result.has_account and !result.has_usage) {
+        cfg.usage = cfg.account;
+    }
+    return result;
 }
 
 fn parseRolloutSignature(allocator: std.mem.Allocator, v: std.json.Value) ?RolloutSignature {
@@ -2530,48 +2687,6 @@ fn parseThresholdPercent(v: std.json.Value) ?u8 {
     };
     if (raw < 1 or raw > 100) return null;
     return @as(u8, @intCast(raw));
-}
-
-pub fn refreshAccountsFromAuth(allocator: std.mem.Allocator, codex_home: []const u8, reg: *Registry) !bool {
-    var changed = false;
-    for (reg.accounts.items) |*rec| {
-        const path = resolveStrictAccountAuthPath(allocator, codex_home, rec.account_key) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
-        };
-        defer allocator.free(path);
-        const info = try @import("auth.zig").parseAuthInfo(allocator, path);
-        defer info.deinit(allocator);
-        const email = info.email orelse {
-            std.log.warn("auth file missing email for {s}; skipping refresh", .{rec.email});
-            continue;
-        };
-        const chatgpt_account_id = info.chatgpt_account_id orelse {
-            std.log.warn("auth file missing account_id for {s}; skipping refresh", .{rec.email});
-            continue;
-        };
-        const record_key = info.record_key orelse {
-            std.log.warn("auth file missing record key for {s}; skipping refresh", .{rec.email});
-            continue;
-        };
-        if (!std.mem.eql(u8, email, rec.email)) {
-            std.log.warn("auth file email mismatch for {s}; skipping refresh", .{rec.email});
-            continue;
-        }
-        if (!std.mem.eql(u8, chatgpt_account_id, rec.chatgpt_account_id)) {
-            std.log.warn("auth file account_id mismatch for {s}; skipping refresh", .{rec.email});
-            continue;
-        }
-        if (!std.mem.eql(u8, record_key, rec.account_key)) {
-            std.log.warn("auth file record_key mismatch for {s}; skipping refresh", .{rec.email});
-            continue;
-        }
-        if (rec.plan != info.plan) changed = true;
-        if (rec.auth_mode != info.auth_mode) changed = true;
-        rec.plan = info.plan;
-        rec.auth_mode = info.auth_mode;
-    }
-    return changed;
 }
 
 pub fn autoImportActiveAuth(allocator: std.mem.Allocator, codex_home: []const u8, reg: *Registry) !bool {

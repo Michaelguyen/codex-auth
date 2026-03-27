@@ -1,4 +1,5 @@
 const std = @import("std");
+const account_api = @import("../account_api.zig");
 const registry = @import("../registry.zig");
 const bdd = @import("bdd_helpers.zig");
 
@@ -105,6 +106,7 @@ fn makeAccountRecord(
         .chatgpt_user_id = try chatgptUserIdForEmailAlloc(allocator, email),
         .email = try allocator.dupe(u8, email),
         .alias = try allocator.dupe(u8, alias),
+        .account_name = null,
         .plan = plan,
         .auth_mode = auth_mode,
         .created_at = created_at,
@@ -113,6 +115,20 @@ fn makeAccountRecord(
         .last_usage_at = null,
         .last_local_rollout = null,
     };
+}
+
+fn setRecordIds(
+    allocator: std.mem.Allocator,
+    rec: *registry.AccountRecord,
+    chatgpt_user_id: []const u8,
+    chatgpt_account_id: []const u8,
+) !void {
+    allocator.free(rec.chatgpt_user_id);
+    rec.chatgpt_user_id = try allocator.dupe(u8, chatgpt_user_id);
+    allocator.free(rec.chatgpt_account_id);
+    rec.chatgpt_account_id = try allocator.dupe(u8, chatgpt_account_id);
+    allocator.free(rec.account_key);
+    rec.account_key = try std.fmt.allocPrint(allocator, "{s}::{s}", .{ chatgpt_user_id, chatgpt_account_id });
 }
 
 fn countBackups(dir: std.fs.Dir, prefix: []const u8) !usize {
@@ -182,16 +198,206 @@ test "registry save/load" {
 
     try registry.saveRegistry(gpa, codex_home, &reg);
 
+    const registry_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "accounts", "registry.json" });
+    defer gpa.free(registry_path);
+    const saved = try bdd.readFileAlloc(gpa, registry_path);
+    defer gpa.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"account\": true") != null);
+
     var loaded = try registry.loadRegistry(gpa, codex_home);
     defer loaded.deinit(gpa);
     try std.testing.expect(loaded.accounts.items.len == 1);
     try std.testing.expect(loaded.auto_switch.threshold_5h_percent == 12);
     try std.testing.expect(loaded.auto_switch.threshold_weekly_percent == 8);
     try std.testing.expect(loaded.api.usage);
+    try std.testing.expect(loaded.api.account);
     try std.testing.expect(loaded.active_account_activated_at_ms != null);
     try std.testing.expect(loaded.accounts.items[0].last_local_rollout != null);
     try std.testing.expectEqual(@as(i64, 1735689600000), loaded.accounts.items[0].last_local_rollout.?.event_timestamp_ms);
     try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].last_local_rollout.?.path, "/tmp/sessions/run-1/rollout-a.jsonl"));
+    try std.testing.expect(loaded.accounts.items[0].account_name == null);
+}
+
+test "registry load defaults missing account_name field to null" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try tmp.dir.makePath("accounts");
+    try tmp.dir.writeFile(.{
+        .sub_path = "accounts/registry.json",
+        .data =
+        \\{
+        \\  "schema_version": 3,
+        \\  "active_account_key": null,
+        \\  "accounts": [
+        \\    {
+        \\      "account_key": "user-ESYgcy2QkOGZc0NoxSlFCeVT::67fe2bbb-0de6-49a4-b2b3-d1df366d1faf",
+        \\      "chatgpt_account_id": "67fe2bbb-0de6-49a4-b2b3-d1df366d1faf",
+        \\      "chatgpt_user_id": "user-ESYgcy2QkOGZc0NoxSlFCeVT",
+        \\      "email": "a@b.com",
+        \\      "alias": "work",
+        \\      "plan": "pro",
+        \\      "auth_mode": "chatgpt",
+        \\      "created_at": 1,
+        \\      "last_used_at": null,
+        \\      "last_usage_at": null
+        \\    }
+        \\  ]
+        \\}
+        ,
+    });
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(loaded.accounts.items[0].account_name == null);
+}
+
+test "registry save/load round-trips account_name null" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try tmp.dir.makePath("accounts");
+
+    var reg = makeEmptyRegistry();
+    defer reg.deinit(gpa);
+
+    const rec = try makeAccountRecord(gpa, "a@b.com", "work", .pro, .chatgpt, 1);
+    try reg.accounts.append(gpa, rec);
+    try registry.saveRegistry(gpa, codex_home, &reg);
+
+    const registry_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "accounts", "registry.json" });
+    defer gpa.free(registry_path);
+    const saved = try bdd.readFileAlloc(gpa, registry_path);
+    defer gpa.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"account_name\": null") != null);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(loaded.accounts.items[0].account_name == null);
+}
+
+test "registry save/load round-trips account_name string" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try tmp.dir.makePath("accounts");
+
+    var reg = makeEmptyRegistry();
+    defer reg.deinit(gpa);
+
+    var rec = try makeAccountRecord(gpa, "a@b.com", "work", .pro, .chatgpt, 1);
+    rec.account_name = try gpa.dupe(u8, "abcd");
+    try reg.accounts.append(gpa, rec);
+    try registry.saveRegistry(gpa, codex_home, &reg);
+
+    const registry_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "accounts", "registry.json" });
+    defer gpa.free(registry_path);
+    const saved = try bdd.readFileAlloc(gpa, registry_path);
+    defer gpa.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"account_name\": \"abcd\"") != null);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(loaded.accounts.items[0].account_name != null);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].account_name.?, "abcd"));
+}
+
+test "applyAccountNamesForUser preserves existing account_name when replacement allocation fails" {
+    const gpa = std.testing.allocator;
+    var reg = makeEmptyRegistry();
+    defer reg.deinit(gpa);
+
+    var rec = try makeAccountRecord(gpa, "a@b.com", "work", .pro, .chatgpt, 1);
+    rec.account_name = try gpa.dupe(u8, "Primary Workspace");
+    try reg.accounts.append(gpa, rec);
+
+    var entry = account_api.AccountEntry{
+        .account_id = try gpa.dupe(u8, reg.accounts.items[0].chatgpt_account_id),
+        .account_name = try gpa.dupe(u8, "Ops Workspace"),
+    };
+    defer entry.deinit(gpa);
+
+    var failing_allocator = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    const entries = [_]account_api.AccountEntry{entry};
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        registry.applyAccountNamesForUser(
+            failing_allocator.allocator(),
+            &reg,
+            reg.accounts.items[0].chatgpt_user_id,
+            &entries,
+        ),
+    );
+    try std.testing.expect(reg.accounts.items[0].account_name != null);
+    try std.testing.expectEqualStrings("Primary Workspace", reg.accounts.items[0].account_name.?);
+}
+
+test "applyAccountNamesForUser updates same-user records across personal and team workspaces" {
+    const gpa = std.testing.allocator;
+    var reg = makeEmptyRegistry();
+    defer reg.deinit(gpa);
+
+    var team = try makeAccountRecord(gpa, "same@example.com", "", .team, .chatgpt, 1);
+    try setRecordIds(gpa, &team, "user-shared", "acct-team");
+    team.account_name = try gpa.dupe(u8, "Legacy Workspace");
+    try reg.accounts.append(gpa, team);
+
+    var plus = try makeAccountRecord(gpa, "same@example.com", "", .plus, .chatgpt, 2);
+    try setRecordIds(gpa, &plus, "user-shared", "acct-plus");
+    try reg.accounts.append(gpa, plus);
+
+    var other = try makeAccountRecord(gpa, "other@example.com", "", .team, .chatgpt, 3);
+    try setRecordIds(gpa, &other, "user-other", "acct-other");
+    other.account_name = try gpa.dupe(u8, "Unrelated Workspace");
+    try reg.accounts.append(gpa, other);
+
+    var entry = account_api.AccountEntry{
+        .account_id = try gpa.dupe(u8, "acct-team"),
+        .account_name = try gpa.dupe(u8, "Primary Workspace"),
+    };
+    defer entry.deinit(gpa);
+
+    const entries = [_]account_api.AccountEntry{entry};
+    const changed = try registry.applyAccountNamesForUser(gpa, &reg, "user-shared", &entries);
+    try std.testing.expect(changed);
+    try std.testing.expectEqualStrings("Primary Workspace", reg.accounts.items[0].account_name.?);
+    try std.testing.expect(reg.accounts.items[1].account_name == null);
+    try std.testing.expectEqualStrings("Unrelated Workspace", reg.accounts.items[2].account_name.?);
+}
+
+test "registry save/load round-trips api.account false" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try tmp.dir.makePath("accounts");
+
+    var reg = makeEmptyRegistry();
+    defer reg.deinit(gpa);
+    reg.api.account = false;
+
+    const rec = try makeAccountRecord(gpa, "a@b.com", "work", .pro, .chatgpt, 1);
+    try reg.accounts.append(gpa, rec);
+    try registry.saveRegistry(gpa, codex_home, &reg);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(loaded.api.usage);
+    try std.testing.expect(!loaded.api.account);
 }
 
 test "registry load defaults missing auto threshold fields" {
@@ -222,7 +428,85 @@ test "registry load defaults missing auto threshold fields" {
     try std.testing.expect(loaded.auto_switch.threshold_5h_percent == registry.default_auto_switch_threshold_5h_percent);
     try std.testing.expect(loaded.auto_switch.threshold_weekly_percent == registry.default_auto_switch_threshold_weekly_percent);
     try std.testing.expect(loaded.api.usage);
+    try std.testing.expect(loaded.api.account);
     try std.testing.expect(loaded.active_account_activated_at_ms == null);
+
+    const registry_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "accounts", "registry.json" });
+    defer gpa.free(registry_path);
+    const saved = try bdd.readFileAlloc(gpa, registry_path);
+    defer gpa.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"usage\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"account\": true") != null);
+}
+
+test "registry load backfills missing api.account from api.usage and rewrites file" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try tmp.dir.makePath("accounts");
+    try tmp.dir.writeFile(.{
+        .sub_path = "accounts/registry.json",
+        .data =
+        \\{
+        \\  "schema_version": 3,
+        \\  "active_account_key": null,
+        \\  "api": {
+        \\    "usage": false
+        \\  },
+        \\  "accounts": []
+        \\}
+        ,
+    });
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(!loaded.api.usage);
+    try std.testing.expect(!loaded.api.account);
+
+    const registry_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "accounts", "registry.json" });
+    defer gpa.free(registry_path);
+    const saved = try bdd.readFileAlloc(gpa, registry_path);
+    defer gpa.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"usage\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"account\": false") != null);
+}
+
+test "registry load backfills missing api.usage from api.account and rewrites file" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const codex_home = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(codex_home);
+    try tmp.dir.makePath("accounts");
+    try tmp.dir.writeFile(.{
+        .sub_path = "accounts/registry.json",
+        .data =
+        \\{
+        \\  "schema_version": 3,
+        \\  "active_account_key": null,
+        \\  "api": {
+        \\    "account": false
+        \\  },
+        \\  "accounts": []
+        \\}
+        ,
+    });
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(!loaded.api.usage);
+    try std.testing.expect(!loaded.api.account);
+
+    const registry_path = try std.fs.path.join(gpa, &[_][]const u8{ codex_home, "accounts", "registry.json" });
+    defer gpa.free(registry_path);
+    const saved = try bdd.readFileAlloc(gpa, registry_path);
+    defer gpa.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"usage\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"account\": false") != null);
 }
 
 test "schema 3 registry with legacy rollout attribution rewrites to normalized schema 3" {
@@ -587,6 +871,7 @@ test "clean uses a whitelist and only removes non-current entries under accounts
     try tmp.dir.writeFile(.{ .sub_path = "accounts/auth.json.bak.3", .data = "a3" });
     try tmp.dir.writeFile(.{ .sub_path = "accounts/registry.json.bak.1", .data = "r1" });
     try tmp.dir.writeFile(.{ .sub_path = "accounts/registry.json.bak.2", .data = "r2" });
+    try tmp.dir.writeFile(.{ .sub_path = "accounts/" ++ registry.account_name_refresh_lock_file_name, .data = "" });
     try tmp.dir.writeFile(.{ .sub_path = keep_rel_path, .data = "keep" });
     try tmp.dir.writeFile(.{ .sub_path = "accounts/bGVnYWN5QGV4YW1wbGUuY29t.auth.json", .data = "legacy" });
     try tmp.dir.writeFile(.{ .sub_path = "accounts/notes.txt", .data = "junk" });
@@ -606,6 +891,8 @@ test "clean uses a whitelist and only removes non-current entries under accounts
     try std.testing.expect(try countBackups(accounts, "registry.json") == 0);
     var kept = try tmp.dir.openFile(keep_rel_path, .{});
     kept.close();
+    var refresh_lock = try tmp.dir.openFile("accounts/" ++ registry.account_name_refresh_lock_file_name, .{});
+    refresh_lock.close();
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("accounts/bGVnYWN5QGV4YW1wbGUuY29t.auth.json", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("accounts/notes.txt", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("accounts/tmpdir/old.txt", .{}));

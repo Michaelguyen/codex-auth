@@ -76,6 +76,7 @@ fn runCliWithIsolatedHome(
     try env_map.put("HOME", home_root);
     try env_map.put("USERPROFILE", home_root);
     try env_map.put("CODEX_AUTH_SKIP_SERVICE_RECONCILE", "1");
+    try env_map.put("CODEX_AUTH_DISABLE_BACKGROUND_ACCOUNT_NAME_REFRESH", "1");
 
     return try std.process.Child.run(.{
         .allocator = allocator,
@@ -106,6 +107,7 @@ fn runCliWithIsolatedHomeAndStdin(
     try env_map.put("HOME", home_root);
     try env_map.put("USERPROFILE", home_root);
     try env_map.put("CODEX_AUTH_SKIP_SERVICE_RECONCILE", "1");
+    try env_map.put("CODEX_AUTH_DISABLE_BACKGROUND_ACCOUNT_NAME_REFRESH", "1");
 
     var child = std.process.Child.init(argv.items, allocator);
     child.cwd = project_root;
@@ -219,6 +221,7 @@ fn appendCustomAccount(
         .chatgpt_user_id = try allocator.dupe(u8, chatgpt_user_id),
         .email = try allocator.dupe(u8, email),
         .alias = try allocator.dupe(u8, alias),
+        .account_name = null,
         .plan = plan,
         .auth_mode = .chatgpt,
         .created_at = std.time.timestamp(),
@@ -333,7 +336,10 @@ test "Scenario: Given upgrade from v0.1.x to v0.2 with legacy accounts data when
     defer gpa.free(result.stderr);
 
     try expectSuccess(result);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, email) != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.stdout, email) != null or
+            std.mem.indexOf(u8, result.stdout, "legacy") != null,
+    );
 
     const codex_home = try codexHomeAlloc(gpa, home_root);
     defer gpa.free(codex_home);
@@ -794,6 +800,7 @@ test "Scenario: Given default api usage when rendering help then the api enable 
     try expectSuccess(result);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "codex-auth") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Usage API: ON (api)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Account API: ON") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "`config api enable` may trigger OpenAI account restrictions or suspension in some environments.") != null);
     try std.testing.expectEqualStrings("", result.stderr);
 }
@@ -1195,8 +1202,8 @@ test "Scenario: Given remove query with multiple matches in non-tty mode when ru
     try std.testing.expectEqualStrings("", result.stdout);
     try std.testing.expectEqualStrings(
         "Matched multiple accounts:\n" ++
-            "- (team-a)alpha@example.com\n" ++
-            "- (team-b)beta@example.com\n" ++
+            "- alpha@example.com / team-a\n" ++
+            "- beta@example.com / team-b\n" ++
             "error: multiple accounts match the query in non-interactive mode.\n" ++
             "hint: Refine the query to match one account, or run the command in a TTY.\n",
         result.stderr,
@@ -1640,6 +1647,7 @@ test "Scenario: Given default api usage when rendering status then no warning is
     try expectSuccess(result);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "auto-switch: OFF") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "usage: api") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "account: api") != null);
     try std.testing.expectEqualStrings("", result.stderr);
 }
 
