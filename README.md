@@ -23,7 +23,7 @@ For the best experience, install the Codex CLI even if you mainly use the VS Cod
 npm install -g @openai/codex
 ```
 
-After that, you can use `codex login` or `codex-auth login` to sign in and add accounts more easily.
+After that, you can use `codex login`, `codex login --device-auth`, `codex-auth login`, or `codex-auth login --device-auth` to sign in and add accounts more easily.
 
 ## Install
 
@@ -93,7 +93,7 @@ Remove-Item "$env:LOCALAPPDATA\codex-auth\bin\codex-auth-auto.exe" -Force -Error
 | Command | Description |
 |---------|-------------|
 | `codex-auth list` | List all accounts |
-| `codex-auth login` | Run `codex login`, then add the current account |
+| `codex-auth login [--device-auth]` | Run `codex login` (optionally with `--device-auth`), then add the current account |
 | `codex-auth switch [<email>]` | Switch active account interactively or by partial match |
 | `codex-auth remove` | Remove accounts with interactive multi-select |
 | `codex-auth status` | Show auto-switch, service, and usage status |
@@ -158,6 +158,7 @@ Add the currently logged-in Codex account:
 
 ```shell
 codex-auth login
+codex-auth login --device-auth
 ```
 
 ### Import
@@ -289,38 +290,6 @@ Upgrade notes:
 
 - If you are upgrading from `v0.1.x` to the latest `v0.2.x`, API usage refresh is enabled by default.
 - If you previously used an early `v0.2` prerelease/test build and `status` still shows `usage: local`, run `codex-auth config api enable` once to switch back to API mode.
-
-### How to import tokens from cli-proxy-api?
-
-If you have token files from `~/.cli-proxy-api/token*.json`, this repository includes a helper script that can convert them into a format codex-auth can read.
-
-The CLI can also import the flat cli-proxy-api / CPA JSON files directly:
-
-```shell
-codex-auth import --cpa                  # default source: ~/.cli-proxy-api
-codex-auth import --cpa /path/to/cpa-dir # scans direct child .json files
-```
-
-Each CPA file is converted in memory to the standard auth snapshot shape before it is written into `~/.codex/accounts/`. Missing or empty `refresh_token` values are skipped as `MissingRefreshToken`.
-
-The script is not bundled in the published npm package, so run it from a clone of this repository:
-
-```shell
-# Convert: ~/.cli-proxy-api → /tmp/tokens
-python3 scripts/convert_tokens.sh
-
-# Or specify custom directories
-python3 scripts/convert_tokens.sh <source_dir> <output_dir>
-```
-
-Then import and switch:
-
-```shell
-codex-auth import /tmp/tokens/
-# or import the CPA files directly without a conversion step
-codex-auth import --cpa
-codex-auth switch
-```
 
 Verify with:
 
