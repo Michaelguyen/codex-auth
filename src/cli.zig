@@ -2123,5 +2123,5 @@ test "Scenario: Given grouped accounts when rendering switch list then child row
 
     const output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "01   Als's Workspace") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "02   free") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "02   Free") != null);
 }
