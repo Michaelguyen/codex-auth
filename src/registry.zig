@@ -15,6 +15,14 @@ pub const min_supported_schema_version: u32 = 2;
 pub const default_auto_switch_threshold_5h_percent: u8 = 10;
 pub const default_auto_switch_threshold_weekly_percent: u8 = 5;
 pub const account_name_refresh_lock_file_name = "account-name-refresh.lock";
+const private_file_permissions: fs.File.Permissions = switch (builtin.os.tag) {
+    .windows => .default_file,
+    else => fs.File.Permissions.fromMode(0o600),
+};
+const private_dir_permissions: fs.File.Permissions = switch (builtin.os.tag) {
+    .windows => .default_dir,
+    else => fs.File.Permissions.fromMode(0o700),
+};
 
 fn normalizeEmailAlloc(allocator: std.mem.Allocator, email: []const u8) ![]u8 {
     var buf = try allocator.alloc(u8, email.len);
@@ -362,10 +370,28 @@ pub fn resolveUserHome(allocator: std.mem.Allocator) ![]u8 {
     return error.EnvironmentVariableNotFound;
 }
 
+fn hardenPathPermissions(path: []const u8, permissions: fs.File.Permissions) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    try fs.cwd().inner.setFilePermissions(fs.io(), path, permissions, .{});
+}
+
+pub fn hardenSensitiveFile(path: []const u8) !void {
+    try hardenPathPermissions(path, private_file_permissions);
+}
+
+fn hardenSensitiveDir(path: []const u8) !void {
+    try hardenPathPermissions(path, private_dir_permissions);
+}
+
+fn ensurePrivateDir(path: []const u8) !void {
+    try fs.cwd().makePath(path);
+    try hardenSensitiveDir(path);
+}
+
 pub fn ensureAccountsDir(allocator: std.mem.Allocator, codex_home: []const u8) !void {
     const accounts_dir = try fs.path.join(allocator, &[_][]const u8{ codex_home, "accounts" });
     defer allocator.free(accounts_dir);
-    try fs.cwd().makePath(accounts_dir);
+    try ensurePrivateDir(accounts_dir);
 }
 
 pub fn registryPath(allocator: std.mem.Allocator, codex_home: []const u8) ![]u8 {
@@ -423,14 +449,40 @@ pub fn activeAuthPath(allocator: std.mem.Allocator, codex_home: []const u8) ![]u
     return try fs.path.join(allocator, &[_][]const u8{ codex_home, "auth.json" });
 }
 
+fn copyFileWithPermissions(src: []const u8, dest: []const u8, permissions: ?fs.File.Permissions) !void {
+    try fs.cwd().copyFile(src, fs.cwd(), dest, .{ .permissions = permissions });
+}
+
+fn existingFilePermissions(path: []const u8) !?fs.File.Permissions {
+    const stat = fs.cwd().statFile(path) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return stat.permissions;
+}
+
 pub fn copyFile(src: []const u8, dest: []const u8) !void {
-    try fs.cwd().copyFile(src, fs.cwd(), dest, .{});
+    try copyFileWithPermissions(src, dest, null);
+}
+
+pub fn copyManagedFile(src: []const u8, dest: []const u8) !void {
+    try copyFileWithPermissions(src, dest, private_file_permissions);
+    try hardenSensitiveFile(dest);
+}
+
+fn replaceFilePreservingPermissions(src: []const u8, dest: []const u8) !void {
+    const permissions = try existingFilePermissions(dest);
+    try copyFileWithPermissions(src, dest, permissions);
 }
 
 fn writeFile(path: []const u8, data: []const u8) !void {
-    var file = try fs.cwd().createFile(path, .{ .truncate = true });
+    var file = try fs.cwd().createFile(path, .{
+        .truncate = true,
+        .permissions = private_file_permissions,
+    });
     defer file.close();
     try file.writeAll(data);
+    try hardenSensitiveFile(path);
 }
 
 const max_backups: usize = 5;
@@ -473,10 +525,6 @@ fn fileEqualsBytes(allocator: std.mem.Allocator, path: []const u8, bytes: []cons
     defer if (data) |buf| allocator.free(buf);
     if (data == null) return false;
     return std.mem.eql(u8, data.?, bytes);
-}
-
-fn ensureDir(path: []const u8) !void {
-    try fs.cwd().makePath(path);
 }
 
 fn backupDir(allocator: std.mem.Allocator, codex_home: []const u8) ![]u8 {
@@ -710,7 +758,7 @@ pub fn backupAuthIfChanged(
 ) !void {
     const dir = try backupDir(allocator, codex_home);
     defer allocator.free(dir);
-    try ensureDir(dir);
+    try ensureAccountsDir(allocator, codex_home);
 
     if (!(try filesEqual(allocator, current_auth_path, new_auth_path))) {
         if (fs.cwd().openFile(current_auth_path, .{})) |file| {
@@ -720,7 +768,7 @@ pub fn backupAuthIfChanged(
         }
         const backup = try makeBackupPath(allocator, dir, "auth.json");
         defer allocator.free(backup);
-        try fs.cwd().copyFile(current_auth_path, fs.cwd(), backup, .{});
+        try copyManagedFile(current_auth_path, backup);
         try pruneBackups(allocator, dir, "auth.json", max_backups);
     }
 }
@@ -733,7 +781,7 @@ fn backupRegistryIfChanged(
 ) !void {
     const dir = try backupDir(allocator, codex_home);
     defer allocator.free(dir);
-    try ensureDir(dir);
+    try ensureAccountsDir(allocator, codex_home);
 
     if (try fileEqualsBytes(allocator, current_registry_path, new_registry_bytes)) {
         return;
@@ -747,7 +795,7 @@ fn backupRegistryIfChanged(
 
     const backup = try makeBackupPath(allocator, dir, "registry.json");
     defer allocator.free(backup);
-    try fs.cwd().copyFile(current_registry_path, fs.cwd(), backup, .{});
+    try copyManagedFile(current_registry_path, backup);
     try pruneBackups(allocator, dir, "registry.json", max_backups);
 }
 
@@ -1227,7 +1275,7 @@ fn importAuthInfo(
     defer allocator.free(dest);
 
     try ensureAccountsDir(allocator, codex_home);
-    try copyFile(auth_file, dest);
+    try copyManagedFile(auth_file, dest);
 
     const record = try accountFromAuth(allocator, alias, info);
     try upsertAccount(allocator, reg, record);
@@ -1555,7 +1603,7 @@ fn syncCurrentAuthBestEffort(
     const dest = try accountAuthPath(allocator, codex_home, record_key);
     defer allocator.free(dest);
     try ensureAccountsDir(allocator, codex_home);
-    try copyFile(auth_path, dest);
+    try copyManagedFile(auth_path, dest);
 
     if (existing_idx) |idx| {
         const email = info.email.?;
@@ -1669,7 +1717,7 @@ pub fn syncActiveAccountFromAuth(allocator: std.mem.Allocator, codex_home: []con
         defer allocator.free(dest);
 
         try ensureAccountsDir(allocator, codex_home);
-        try copyFile(auth_path, dest);
+        try copyManagedFile(auth_path, dest);
 
         var record = try accountFromAuth(allocator, "", &info);
         var record_owned = true;
@@ -1707,8 +1755,10 @@ pub fn syncActiveAccountFromAuth(allocator: std.mem.Allocator, codex_home: []con
     const dest = try accountAuthPath(allocator, codex_home, rec_account_key);
     defer allocator.free(dest);
     if (!(try fileEqualsBytes(allocator, dest, auth_bytes))) {
-        try copyFile(auth_path, dest);
+        try copyManagedFile(auth_path, dest);
         changed = true;
+    } else {
+        try hardenSensitiveFile(dest);
     }
 
     try setActiveAccountKey(allocator, reg, rec_account_key);
@@ -1945,7 +1995,7 @@ pub fn activateAccountByKey(
     defer allocator.free(dest);
 
     try backupAuthIfChanged(allocator, codex_home, dest, src);
-    try copyFile(src, dest);
+    try replaceFilePreservingPermissions(src, dest);
     try setActiveAccountKey(allocator, reg, account_key);
 }
 
@@ -1962,7 +2012,8 @@ pub fn replaceActiveAuthWithAccountByKey(
     const dest = try activeAuthPath(allocator, codex_home);
     defer allocator.free(dest);
 
-    try copyFile(src, dest);
+    try ensureAccountsDir(allocator, codex_home);
+    try replaceFilePreservingPermissions(src, dest);
     try setActiveAccountKey(allocator, reg, account_key);
 }
 
@@ -2187,7 +2238,7 @@ fn parseOptionalStoredStringAlloc(allocator: std.mem.Allocator, value: ?std.json
 
 fn maybeCopyFile(src: []const u8, dest: []const u8) !void {
     if (std.mem.eql(u8, src, dest)) return;
-    try copyFile(src, dest);
+    try copyManagedFile(src, dest);
 }
 
 fn resolveLegacySnapshotPathForEmail(
@@ -2517,7 +2568,10 @@ fn writeRegistryFileReplace(path: []const u8, data: []const u8) !void {
     defer allocator.free(backup_path);
 
     {
-        var file = try fs.cwd().createFile(temp_path, .{ .truncate = true });
+        var file = try fs.cwd().createFile(temp_path, .{
+            .truncate = true,
+            .permissions = private_file_permissions,
+        });
         defer file.close();
         try file.writeAll(data);
         try file.sync();
@@ -2543,6 +2597,7 @@ fn writeRegistryFileReplace(path: []const u8, data: []const u8) !void {
             else => return err,
         };
     }
+    try hardenSensitiveFile(path);
 }
 
 fn writeRegistryFileAtomic(path: []const u8, data: []const u8) !void {
@@ -2550,10 +2605,14 @@ fn writeRegistryFileAtomic(path: []const u8, data: []const u8) !void {
         return writeRegistryFileReplace(path, data);
     }
     var buf: [4096]u8 = undefined;
-    var atomic_file = try fs.cwd().atomicFile(path, .{ .write_buffer = &buf });
+    var atomic_file = try fs.cwd().atomicFile(path, .{
+        .write_buffer = &buf,
+        .permissions = private_file_permissions,
+    });
     defer atomic_file.deinit();
     try atomic_file.file_writer.interface.writeAll(data);
     try atomic_file.finish();
+    try hardenSensitiveFile(path);
 }
 
 pub fn saveRegistry(allocator: std.mem.Allocator, codex_home: []const u8, reg: *Registry) !void {
@@ -2577,6 +2636,7 @@ pub fn saveRegistry(allocator: std.mem.Allocator, codex_home: []const u8, reg: *
     const data = aw.written();
 
     if (try fileEqualsBytes(allocator, path, data)) {
+        try hardenSensitiveFile(path);
         return;
     }
 
@@ -2798,7 +2858,7 @@ pub fn autoImportActiveAuth(allocator: std.mem.Allocator, codex_home: []const u8
     defer allocator.free(dest);
 
     try ensureAccountsDir(allocator, codex_home);
-    try copyFile(auth_path, dest);
+    try copyManagedFile(auth_path, dest);
 
     const record = try accountFromAuth(allocator, "", &info);
     try upsertAccount(allocator, reg, record);
