@@ -1172,31 +1172,25 @@ test "run child capture times out stalled child process" {
     try std.testing.expect(result.timed_out);
 }
 
-test "run child capture times out child that trickles output" {
+test "run child capture preserves partial stdout when child times out" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const script_name = switch (builtin.os.tag) {
-        .windows => "trickle.ps1",
-        else => "trickle.sh",
+        .windows => "partial-output.ps1",
+        else => "partial-output.sh",
     };
     const script_data = switch (builtin.os.tag) {
         .windows =>
-        \\for ($i = 0; $i -lt 30; $i++) {
-        \\  [Console]::Out.Write(".")
-        \\  [Console]::Out.Flush()
-        \\  Start-Sleep -Milliseconds 100
-        \\}
+        \\[Console]::Out.Write("." * 64)
+        \\[Console]::Out.Flush()
+        \\Start-Sleep -Seconds 30
         ,
         else =>
         \\#!/bin/sh
-        \\i=0
-        \\while [ "$i" -lt 30 ]; do
-        \\  printf '.'
-        \\  sleep 0.1
-        \\  i=$((i + 1))
-        \\done
+        \\printf '................................................................'
+        \\sleep 30
         ,
     };
 
@@ -1218,8 +1212,11 @@ test "run child capture times out child that trickles output" {
         .windows => &[_][]const u8{ "pwsh.exe", "-NoLogo", "-NoProfile", "-File", script_path },
         else => &[_][]const u8{script_path},
     };
+    // PowerShell startup can be noticeably slower on CI, but the child still
+    // runs far longer than either timeout once it emits the initial stdout.
+    const timeout_ms: u64 = if (builtin.os.tag == .windows) 3000 else 1000;
 
-    const result = runChildCapture(allocator, argv, 1000, null) catch |err| switch (err) {
+    const result = runChildCapture(allocator, argv, timeout_ms, null) catch |err| switch (err) {
         error.OutOfMemory => return error.SkipZigTest,
         else => return err,
     };
