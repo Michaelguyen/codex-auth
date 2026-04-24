@@ -190,6 +190,7 @@ fn isHandledCliError(err: anyerror) bool {
     return err == error.AccountNotFound or
         err == error.CodexLoginFailed or
         err == error.ListLiveRequiresTty or
+        err == error.TuiOutputUnavailable or
         err == error.NodeJsRequired or
         err == error.SwitchSelectionRequiresTty or
         err == error.RemoveConfirmationUnavailable or
@@ -3586,6 +3587,10 @@ test "live tty preflight reports command-specific errors" {
     try std.testing.expect(liveTtyPreflightError(.list, false, true).? == error.ListLiveRequiresTty);
     try std.testing.expect(liveTtyPreflightError(.switch_account, true, false).? == error.SwitchSelectionRequiresTty);
     try std.testing.expect(liveTtyPreflightError(.remove_account, false, false).? == error.RemoveSelectionRequiresTty);
+}
+
+test "live tui output loss is a handled cli error" {
+    try std.testing.expect(isHandledCliError(error.TuiOutputUnavailable));
 }
 
 test "buildStatusLine releases mutex on allocation failure" {

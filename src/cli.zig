@@ -270,6 +270,13 @@ fn activeRowMarker(is_cursor_or_selected: bool, is_active: bool) []const u8 {
 const TuiSavedInputState = if (builtin.os.tag == .windows) win.DWORD else std.posix.termios;
 const TuiSavedOutputState = if (builtin.os.tag == .windows) win.DWORD else void;
 
+fn mapTuiOutputError(err: anyerror) anyerror {
+    return switch (err) {
+        error.WriteFailed => error.TuiOutputUnavailable,
+        else => err,
+    };
+}
+
 const TuiSession = struct {
     input: std.Io.File,
     output: std.Io.File,
@@ -316,7 +323,7 @@ const TuiSession = struct {
                 .saved_output_state = saved_output_mode,
             };
             session.writer = session.output.writer(app_runtime.io(), &session.writer_buffer);
-            try session.enter();
+            session.enter() catch |err| return mapTuiOutputError(err);
             return session;
         } else {
             const saved_termios = try std.posix.tcgetattr(input.handle);
@@ -334,7 +341,7 @@ const TuiSession = struct {
                 .saved_input_state = saved_termios,
             };
             session.writer = session.output.writer(app_runtime.io(), &session.writer_buffer);
-            try session.enter();
+            session.enter() catch |err| return mapTuiOutputError(err);
             return session;
         }
     }
@@ -419,7 +426,11 @@ const TuiSession = struct {
     }
 
     fn resetFrame(self: *@This()) !void {
-        try writeTuiResetFrameTo(self.out());
+        writeTuiResetFrameTo(self.out()) catch |err| return mapTuiOutputError(err);
+    }
+
+    fn flushOutput(self: *@This()) !void {
+        self.out().flush() catch |err| return mapTuiOutputError(err);
     }
 };
 
@@ -2022,7 +2033,7 @@ pub fn selectAccountWithLiveUpdates(
         const selected_display_idx = selectedDisplayIndexForRender(&rows, selected_idx, number_buf[0..number_len]);
 
         try tui.resetFrame();
-        try renderSwitchScreen(
+        renderSwitchScreen(
             out,
             borrowed.reg,
             rows.items,
@@ -2033,8 +2044,8 @@ pub fn selectAccountWithLiveUpdates(
             status_line,
             "",
             number_buf[0..number_len],
-        );
-        try out.flush();
+        ) catch |err| return mapTuiOutputError(err);
+        try tui.flushOutput();
 
         switch (try pollTuiInput(tui.input, ui_tick_ms, tui_poll_error_mask)) {
             .timeout => {
@@ -2239,7 +2250,7 @@ pub fn viewAccountsWithLiveUpdates(
         defer allocator.free(status_line);
 
         try tui.resetFrame();
-        try renderListScreen(
+        renderListScreen(
             out,
             &current_display.reg,
             rows.items,
@@ -2247,8 +2258,8 @@ pub fn viewAccountsWithLiveUpdates(
             rows.widths,
             use_color,
             status_line,
-        );
-        try out.flush();
+        ) catch |err| return mapTuiOutputError(err);
+        try tui.flushOutput();
 
         switch (try pollTuiInput(tui.input, ui_tick_ms, tui_poll_error_mask)) {
             .timeout => {
@@ -2372,7 +2383,7 @@ pub fn runSwitchLiveActions(
         const selected_display_idx = selectedDisplayIndexForRender(&rows, selected_idx, number_buf[0..number_len]);
 
         try tui.resetFrame();
-        try renderSwitchScreen(
+        renderSwitchScreen(
             out,
             borrowed.reg,
             rows.items,
@@ -2383,8 +2394,8 @@ pub fn runSwitchLiveActions(
             status_line,
             action_message orelse "",
             number_buf[0..number_len],
-        );
-        try out.flush();
+        ) catch |err| return mapTuiOutputError(err);
+        try tui.flushOutput();
 
         switch (try pollTuiInput(tui.input, ui_tick_ms, tui_poll_error_mask)) {
             .timeout => {
@@ -2653,7 +2664,7 @@ pub fn runRemoveLiveActions(
         defer allocator.free(status_line);
 
         try tui.resetFrame();
-        try renderRemoveScreen(
+        renderRemoveScreen(
             out,
             borrowed.reg,
             rows.items,
@@ -2665,8 +2676,8 @@ pub fn runRemoveLiveActions(
             status_line,
             action_message orelse "",
             number_buf[0..number_len],
-        );
-        try out.flush();
+        ) catch |err| return mapTuiOutputError(err);
+        try tui.flushOutput();
 
         switch (try pollTuiInput(tui.input, ui_tick_ms, tui_poll_error_mask)) {
             .timeout => {
@@ -3343,7 +3354,7 @@ fn selectInteractiveFromIndices(
             number_buf[0..number_len],
         );
         try tui.resetFrame();
-        try renderSwitchScreen(
+        renderSwitchScreen(
             out,
             reg,
             rows.items,
@@ -3354,8 +3365,8 @@ fn selectInteractiveFromIndices(
             "",
             "",
             number_buf[0..number_len],
-        );
-        try out.flush();
+        ) catch |err| return mapTuiOutputError(err);
+        try tui.flushOutput();
 
         if (comptime builtin.os.tag == .windows) {
             switch (try tui.readWindowsKey()) {
@@ -3596,7 +3607,7 @@ fn selectInteractive(
             number_buf[0..number_len],
         );
         try tui.resetFrame();
-        try renderSwitchScreen(
+        renderSwitchScreen(
             out,
             reg,
             rows.items,
@@ -3607,8 +3618,8 @@ fn selectInteractive(
             "",
             "",
             number_buf[0..number_len],
-        );
-        try out.flush();
+        ) catch |err| return mapTuiOutputError(err);
+        try tui.flushOutput();
 
         if (comptime builtin.os.tag == .windows) {
             switch (try tui.readWindowsKey()) {
@@ -3770,12 +3781,12 @@ fn selectRemoveInteractive(
 
     while (true) {
         try tui.resetFrame();
-        try writeTuiPromptLine(out, "Select accounts to delete:", number_buf[0..number_len]);
-        try out.writeAll("\n");
-        try renderRemoveList(out, reg, rows.items, idx_width, widths, idx, checked, use_color);
-        try out.writeAll("\n");
-        try writeRemoveTuiFooter(out, use_color);
-        try out.flush();
+        writeTuiPromptLine(out, "Select accounts to delete:", number_buf[0..number_len]) catch |err| return mapTuiOutputError(err);
+        out.writeAll("\n") catch |err| return mapTuiOutputError(err);
+        renderRemoveList(out, reg, rows.items, idx_width, widths, idx, checked, use_color) catch |err| return mapTuiOutputError(err);
+        out.writeAll("\n") catch |err| return mapTuiOutputError(err);
+        writeRemoveTuiFooter(out, use_color) catch |err| return mapTuiOutputError(err);
+        try tui.flushOutput();
 
         if (comptime builtin.os.tag == .windows) {
             switch (try tui.readWindowsKey()) {
@@ -4998,6 +5009,11 @@ test "Scenario: Given non-Windows console labels when rendering unicode-prone ou
     try std.testing.expectEqualStrings("✓", importReportMarker(.imported, false));
     try std.testing.expectEqualStrings("✓", importReportMarker(.updated, false));
     try std.testing.expectEqualStrings("✗", importReportMarker(.skipped, false));
+}
+
+test "Scenario: Given a live TUI write failure when mapping output errors then it becomes a handled TUI error" {
+    try std.testing.expect(mapTuiOutputError(error.WriteFailed) == error.TuiOutputUnavailable);
+    try std.testing.expect(mapTuiOutputError(error.EndOfStream) == error.EndOfStream);
 }
 
 test "Scenario: Given usage overrides when rendering remove list then failed rows show response status in both usage columns" {
