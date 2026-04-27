@@ -14,6 +14,7 @@ permissions:
 jobs:
   build-test:
     name: Build & Test (${{ matrix.os }})
+    if: ${{ github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore: release v') }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

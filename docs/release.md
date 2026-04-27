@@ -36,10 +36,10 @@ This document describes the repository's CI, preview package publishing, and tag
 5. Commit and push `main`.
    - Commit with a release message such as `chore: release v<version>`.
    - Push the commit to `origin/main`.
-6. Wait for the post-push `CI` run for that exact `main` commit.
-   - Do not create the release tag until the latest `CI` run for the pushed release commit succeeds.
-   - If that `CI` run fails or terminates unexpectedly before any release tag is pushed, fix the problem and push a new commit that keeps the same target version.
-   - Re-run the validation steps, push `main`, and wait for `CI` again.
+6. Push the release commit.
+   - Release commits use the message `chore: release v<version>`.
+   - The `CI` workflow skips those release-only commits on `main` because the version change is validated locally before pushing and contains only release metadata.
+   - Do not use the release commit message prefix for non-release changes.
 7. Create and push the release tag.
    - Create an annotated tag named `v<version>`.
    - Push that tag to `origin`.
