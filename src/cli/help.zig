@@ -377,7 +377,7 @@ fn writeExampleLines(out: *std.Io.Writer, topic: HelpTopic) !void {
         .config => {
             try out.writeAll("  codex-auth config auto --5h 12 --weekly 8\n");
             try out.writeAll("  codex-auth config api enable\n");
-            try out.writeAll("  codex-auth config live --interval 30\n");
+            try out.writeAll("  codex-auth config live --interval 60\n");
         },
         .daemon => {
             try out.writeAll("  codex-auth daemon --watch\n");

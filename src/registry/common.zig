@@ -90,7 +90,7 @@ pub const ApiConfig = struct {
     account: bool = true,
 };
 
-pub const default_live_refresh_interval_seconds: u16 = 30;
+pub const default_live_refresh_interval_seconds: u16 = 60;
 pub const min_live_refresh_interval_seconds: u16 = 5;
 pub const max_live_refresh_interval_seconds: u16 = 3600;
 

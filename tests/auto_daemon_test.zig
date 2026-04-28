@@ -1599,7 +1599,7 @@ test "Scenario: Given status when rendering then auto and usage api settings are
         .threshold_weekly_percent = 8,
         .api_usage_enabled = false,
         .api_account_enabled = false,
-        .live_interval_seconds = 30,
+        .live_interval_seconds = 60,
     });
 
     const output = aw.written();
@@ -1608,7 +1608,7 @@ test "Scenario: Given status when rendering then auto and usage api settings are
     try std.testing.expect(std.mem.indexOf(u8, output, "thresholds: 5h<12%, weekly<8%") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "usage: local") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "account: disabled") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "live refresh: 30s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "live refresh: 60s") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Warning: Usage refresh is currently using the ChatGPT usage API") == null);
 }
 

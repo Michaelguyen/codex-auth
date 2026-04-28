@@ -157,7 +157,7 @@ fn sleepLiveRefreshTask(io: std.Io) void {
 }
 
 test "live refresh interval uses the shared live config cadence" {
-    try std.testing.expectEqual(@as(i64, 30_000), switch_live_default_refresh_interval_ms);
+    try std.testing.expectEqual(@as(i64, 60_000), switch_live_default_refresh_interval_ms);
 }
 
 test "initial live selection display uses stored api defaults for list, switch, and remove" {

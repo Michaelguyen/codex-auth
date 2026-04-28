@@ -418,7 +418,7 @@ test "Scenario: Given config and daemon help when rendering then special modes a
     try std.testing.expect(std.mem.indexOf(u8, config_help, "--weekly <percent>\n                    Set the weekly usage threshold from 1 to 100.") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_help, "codex-auth config live --interval <seconds>") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_help, "live --interval <seconds>\n                    Set the live TUI refresh interval from 5 to 3600 seconds.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config_help, "codex-auth config live --interval 30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_help, "codex-auth config live --interval 60") != null);
 
     const daemon_help = daemon_aw.written();
     try std.testing.expect(std.mem.indexOf(u8, daemon_help, "--watch   Run continuously and switch accounts when thresholds are reached.") != null);
